@@ -1,83 +1,113 @@
-# rag.py – PubMed Q&A with sources (imports work on any LangChain version)
+# rag.py – PubMed RAG without LangChain
+import os
+import streamlit as st
 from uuid import uuid4
 from pathlib import Path
 from dotenv import load_dotenv
+import chromadb
+from chromadb.utils import embedding_functions
+from groq import Groq
+from sentence_transformers import SentenceTransformer
+import requests
 
-# Core LangChain imports (always available via langchain-core)
-from langchain_core.documents import Document
-from langchain_core.prompts import PromptTemplate
-
-# ------------------------------------------------------------------
-# Resilient imports for text splitter, embeddings, vector store, and QA chain
-# ------------------------------------------------------------------
-
-# 1. Text Splitter – try dedicated package, fallback to community, then core
-try:
-    from langchain_text_splitters import RecursiveCharacterTextSplitter
-except ImportError:
-    try:
-        from langchain_community.text_splitter import RecursiveCharacterTextSplitter
-    except ImportError:
-        from langchain_text_splitters import RecursiveCharacterTextSplitter
-
-# 2. Embeddings – try huggingface package, fallback to community
-try:
-    from langchain_huggingface import HuggingFaceEmbeddings
-except ImportError:
-    from langchain_community.embeddings import HuggingFaceEmbeddings
-
-# 3. Vector store – try chroma package, fallback to community
-try:
-    from langchain_chroma import Chroma
-except ImportError:
-    from langchain_community.vectorstores import Chroma
-
-# 4. Retrieval QA – try chains, fallback to community, then legacy import
-try:
-    from langchain.chains import RetrievalQA
-except ImportError:
-    try:
-        from langchain_community.chains import RetrievalQA
-    except ImportError:
-        try:
-            from langchain.chains.retrieval_qa.base import RetrievalQA
-        except ImportError:
-            from langchain import RetrievalQA   # very old versions
-
-# ------------------------------------------------------------------
-
-from langchain_groq import ChatGroq
 from pubmed import PubMedRetriever
 
-load_dotenv()
+# ----------------------------------------------------------------------
+# 🔐 API key: Streamlit secrets (cloud) or .env (local)
+# ----------------------------------------------------------------------
+try:
+    GROQ_API_KEY = st.secrets["GROQ_API_KEY"]
+except Exception:
+    load_dotenv()
+    GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+    if not GROQ_API_KEY:
+        raise ValueError("GROQ_API_KEY not found in secrets or .env")
 
+# ----------------------------------------------------------------------
+# Constants
+# ----------------------------------------------------------------------
 CHUNK_SIZE = 1000
+CHUNK_OVERLAP = 200
 EMBEDDING_MODEL = "sentence-transformers/all-MiniLM-L6-v2"
 VECTORSTORE_DIR = Path(__file__).parent / "resources/vectorstore"
 COLLECTION_NAME = "medical_articles"
 
-llm = None
-vector_store = None
+# ----------------------------------------------------------------------
+# Initialise components
+# ----------------------------------------------------------------------
+client = None          # Groq client
+vector_store = None    # Chroma collection
+embedder = None        # SentenceTransformer
 
 
 def initialize_components():
-    global llm, vector_store
-    if llm is None:
-        llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0.9, max_tokens=500)
+    global client, vector_store, embedder
+    if client is None:
+        client = Groq(api_key=GROQ_API_KEY)
+    if embedder is None:
+        embedder = SentenceTransformer(EMBEDDING_MODEL)
     if vector_store is None:
-        ef = HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL, model_kwargs={"trust_remote_code": True})
-        vector_store = Chroma(
-            collection_name=COLLECTION_NAME,
-            embedding_function=ef,
-            persist_directory=str(VECTORSTORE_DIR)
-        )
+        # Use Chroma's persistent client
+        chroma_client = chromadb.PersistentClient(path=str(VECTORSTORE_DIR))
+        # Use a custom embedding function that wraps SentenceTransformer
+        class SentenceTransformerEmbeddingFunction(embedding_functions.EmbeddingFunction):
+            def __init__(self, model):
+                self.model = model
+
+            def __call__(self, texts):
+                return self.model.encode(texts, convert_to_numpy=True).tolist()
+
+        embed_fn = SentenceTransformerEmbeddingFunction(embedder)
+        # Get or create collection
+        try:
+            collection = chroma_client.get_collection(COLLECTION_NAME)
+        except ValueError:
+            collection = chroma_client.create_collection(
+                name=COLLECTION_NAME,
+                embedding_function=embed_fn
+            )
+        vector_store = collection
 
 
+# ----------------------------------------------------------------------
+# Text splitter (recursive character split)
+# ----------------------------------------------------------------------
+def split_text(text, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
+    """Split text into chunks with overlap."""
+    if len(text) <= chunk_size:
+        return [text]
+    chunks = []
+    start = 0
+    while start < len(text):
+        end = min(start + chunk_size, len(text))
+        # If we're not at the end, try to break at a sentence boundary (., !, ?, \n)
+        if end < len(text):
+            # Look for last period or newline within the chunk
+            for sep in ['. ', '? ', '! ', '\n\n', '\n', '.', '?', '!']:
+                last_sep = text.rfind(sep, start, end)
+                if last_sep != -1:
+                    end = last_sep + len(sep)
+                    break
+        chunks.append(text[start:end].strip())
+        start = end - overlap if end < len(text) else len(text)
+    return chunks
+
+
+# ----------------------------------------------------------------------
+# Process PubMed articles (kept as `process_urls` for compatibility)
+# ----------------------------------------------------------------------
 def process_urls(search_term: str, max_results: int = 20):
     yield "Initializing Components"
     initialize_components()
+
     yield "Resetting vector store...✅"
-    vector_store.reset_collection()
+    # Delete all documents from the collection (if any)
+    try:
+        all_ids = vector_store.get()["ids"]
+        if all_ids:
+            vector_store.delete(ids=all_ids)
+    except Exception:
+        pass
 
     yield f"Searching PubMed for '{search_term}' (max {max_results} results)..."
     pmid_list = PubMedRetriever.search_pubmed_articles(search_term, max_results=max_results)
@@ -89,72 +119,98 @@ def process_urls(search_term: str, max_results: int = 20):
     articles = PubMedRetriever.fetch_pubmed_abstracts(pmid_list)
     yield f"Fetched {len(articles)} articles. Building documents..."
 
+    # Prepare documents for Chroma
+    ids = []
     documents = []
+    metadatas = []
+
     for art in articles:
-        abstract_text = "\n".join(f"{label}: {text}" for label, text in art["abstract"].items())
+        abstract_text = "\n".join(
+            f"{label}: {text}" for label, text in art["abstract"].items()
+        )
         content = f"Title: {art['title']}\n{abstract_text}"
         source_str = f"PMID: {art['pmid']} – {art['title']}"
-        metadata = {
-            "pmid": art["pmid"],
-            "journal": art["journal"],
-            "authors": art["authors"],
-            "publication_date": art["publication_date"],
-            "source": source_str
-        }
-        documents.append(Document(page_content=content, metadata=metadata))
 
-    yield f"Splitting {len(documents)} documents into chunks..."
-    text_splitter = RecursiveCharacterTextSplitter(separators=["\n\n", "\n", ".", " "], chunk_size=CHUNK_SIZE)
-    docs = text_splitter.split_documents(documents)
+        # Split content into chunks
+        chunks = split_text(content)
+        for chunk in chunks:
+            doc_id = str(uuid4())
+            ids.append(doc_id)
+            documents.append(chunk)
+            metadatas.append({
+                "pmid": art["pmid"],
+                "journal": art["journal"],
+                "authors": art["authors"],
+                "publication_date": art["publication_date"],
+                "source": source_str,
+                "full_text": content  # optional, but can be used if needed
+            })
 
-    yield f"Adding {len(docs)} chunks to vector database..."
-    uuids = [str(uuid4()) for _ in range(len(docs))]
-    vector_store.add_documents(docs, ids=uuids)
+    yield f"Splitting into {len(documents)} chunks. Adding to vector database..."
+    # Add to Chroma in batches
+    batch_size = 100
+    for i in range(0, len(documents), batch_size):
+        vector_store.add(
+            ids=ids[i:i+batch_size],
+            documents=documents[i:i+batch_size],
+            metadatas=metadatas[i:i+batch_size]
+        )
 
     yield "Done adding documents to vector database. ✅"
 
 
+# ----------------------------------------------------------------------
+# Answer a query
+# ----------------------------------------------------------------------
 def generate_answer(query):
     if not vector_store:
         raise RuntimeError("Vector database is not initialized. Call process_urls first.")
 
-    prompt_template = """You are a medical expert. Use the following context to answer the question.
-    If you don't know the answer, say you don't know. Cite the sources using PMID numbers.
+    # Retrieve top-k relevant chunks
+    results = vector_store.query(query_texts=[query], n_results=5)
+    if not results["documents"]:
+        return "I couldn't find any relevant information.", "No sources available."
 
-    Context: {context}
-
-    Question: {question}
-
-    Answer:"""
-    prompt = PromptTemplate(template=prompt_template, input_variables=["context", "question"])
-
-    chain = RetrievalQA.from_chain_type(
-        llm=llm,
-        chain_type="stuff",
-        retriever=vector_store.as_retriever(),
-        return_source_documents=True,
-        chain_type_kwargs={"prompt": prompt}
-    )
-
-    result = chain.invoke({"query": query})
-    answer = result["result"]
-    source_docs = result.get("source_documents", [])
-
+    # Build context from retrieved documents
+    context_parts = []
     sources_set = set()
-    for doc in source_docs:
-        src = doc.metadata.get("source")
-        if src:
-            sources_set.add(src)
+    for doc, meta in zip(results["documents"][0], results["metadatas"][0]):
+        context_parts.append(doc)
+        sources_set.add(meta.get("source", "Unknown source"))
 
+    context = "\n\n".join(context_parts)
     sources = "; ".join(sources_set) if sources_set else "No sources available."
+
+    # Build prompt
+    prompt = f"""You are a medical expert. Use the following context to answer the question.
+If you don't know the answer, say you don't know. Cite the sources using PMID numbers.
+
+Context:
+{context}
+
+Question: {query}
+
+Answer:"""
+
+    # Call Groq API
+    completion = client.chat.completions.create(
+        model="llama-3.3-70b-versatile",
+        messages=[{"role": "user", "content": prompt}],
+        temperature=0.9,
+        max_tokens=500,
+    )
+    answer = completion.choices[0].message.content
+
     return answer, sources
 
 
+# ----------------------------------------------------------------------
+# Local test
+# ----------------------------------------------------------------------
 if __name__ == "__main__":
     search_term = "hypertension treatment guidelines 2024"
     for msg in process_urls(search_term, max_results=10):
         print(msg)
-
     answer, sources = generate_answer("What are the latest treatment guidelines for hypertension?")
     print(f"\nAnswer: {answer}")
     print(f"Sources: {sources}")
