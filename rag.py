@@ -6,6 +6,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 import chromadb
 from chromadb.utils import embedding_functions
+from chromadb.errors import NotFoundError   # ✅ added
 from groq import Groq
 from sentence_transformers import SentenceTransformer
 
@@ -46,20 +47,16 @@ def initialize_components():
     if embedder is None:
         embedder = SentenceTransformer(EMBEDDING_MODEL)
     if vector_store is None:
-        # Use Chroma's persistent client
         chroma_client = chromadb.PersistentClient(path=str(VECTORSTORE_DIR))
-        # Custom embedding function wrapping SentenceTransformer
         class SentenceTransformerEmbeddingFunction(embedding_functions.EmbeddingFunction):
             def __init__(self, model):
                 self.model = model
-
             def __call__(self, texts):
                 return self.model.encode(texts, convert_to_numpy=True).tolist()
-
         embed_fn = SentenceTransformerEmbeddingFunction(embedder)
         try:
             collection = chroma_client.get_collection(COLLECTION_NAME)
-        except ValueError:
+        except NotFoundError:   # ✅ fixed exception
             collection = chroma_client.create_collection(
                 name=COLLECTION_NAME,
                 embedding_function=embed_fn
@@ -71,7 +68,6 @@ def initialize_components():
 # Text splitter (recursive character split)
 # ----------------------------------------------------------------------
 def split_text(text, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
-    """Split text into chunks with overlap."""
     if len(text) <= chunk_size:
         return [text]
     chunks = []
@@ -79,7 +75,6 @@ def split_text(text, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
     while start < len(text):
         end = min(start + chunk_size, len(text))
         if end < len(text):
-            # Try to break at sentence boundaries
             for sep in ['. ', '? ', '! ', '\n\n', '\n', '.', '?', '!']:
                 last_sep = text.rfind(sep, start, end)
                 if last_sep != -1:
@@ -91,18 +86,13 @@ def split_text(text, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
 
 
 # ----------------------------------------------------------------------
-# Process PubMed articles (kept as `process_urls` for compatibility)
+# Process PubMed articles
 # ----------------------------------------------------------------------
 def process_urls(search_term: str, max_results: int = 20):
-    """
-    Search PubMed, fetch articles, store them in the vector DB.
-    Yields progress messages for a streaming UI.
-    """
     yield "Initializing Components"
     initialize_components()
 
     yield "Resetting vector store...✅"
-    # Delete all documents from the collection
     try:
         all_ids = vector_store.get()["ids"]
         if all_ids:
@@ -145,7 +135,6 @@ def process_urls(search_term: str, max_results: int = 20):
             })
 
     yield f"Splitting into {len(documents)} chunks. Adding to vector database..."
-    # Add in batches
     batch_size = 100
     for i in range(0, len(documents), batch_size):
         vector_store.add(
@@ -164,7 +153,6 @@ def generate_answer(query):
     if not vector_store:
         raise RuntimeError("Vector database is not initialized. Call process_urls first.")
 
-    # Retrieve top-k relevant chunks
     results = vector_store.query(query_texts=[query], n_results=5)
     if not results["documents"]:
         return "I couldn't find any relevant information.", "No sources available."
