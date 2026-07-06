@@ -1,24 +1,23 @@
 import streamlit as st
 from rag import process_urls, generate_answer
 
-st.title("MediAssist AI")
+st.title("MediAssist AI - PubMed Q&A")
 
-url1 = st.sidebar.text_input("Search 1")
-url2 = st.sidebar.text_input("Search 2")
-url3 = st.sidebar.text_input("Search 3")
+# Single search term input
+search_term = st.sidebar.text_input("Enter a medical search term", 
+                                    placeholder="e.g., hypertension treatment")
+
+max_results = st.sidebar.slider("Max articles to fetch", 5, 50, 20)
 
 placeholder = st.empty()
 
-process_url_button = st.sidebar.button("Process Searches")
-if process_url_button:
-    urls = [url for url in (url1, url2, url3) if url!='']
-    if len(urls) == 0:
-        placeholder.text("You must provide at least one valid search")
-    else:
-        for status in process_urls(urls):
-            placeholder.text(status)
+process_button = st.sidebar.button("Fetch & Index Articles")
+if process_button and search_term:
+    # Process search term
+    for status in process_urls(search_term, max_results=max_results):
+        placeholder.text(status)
 
-query = placeholder.text_input("Question")
+query = st.text_input("Ask a question about the articles")
 if query:
     try:
         answer, sources = generate_answer(query)
@@ -27,7 +26,7 @@ if query:
 
         if sources:
             st.subheader("Sources:")
-            for source in sources.split("\n"):
+            for source in sources.split("; "):
                 st.write(source)
     except RuntimeError as e:
-        placeholder.text("You must process urls first")
+        placeholder.text("You must fetch articles first (click the button)")
