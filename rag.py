@@ -6,7 +6,6 @@ from pathlib import Path
 from dotenv import load_dotenv
 import chromadb
 from chromadb.utils import embedding_functions
-from chromadb.errors import NotFoundError   # ✅ added
 from groq import Groq
 from sentence_transformers import SentenceTransformer
 
@@ -54,13 +53,11 @@ def initialize_components():
             def __call__(self, texts):
                 return self.model.encode(texts, convert_to_numpy=True).tolist()
         embed_fn = SentenceTransformerEmbeddingFunction(embedder)
-        try:
-            collection = chroma_client.get_collection(COLLECTION_NAME)
-        except NotFoundError:   # ✅ fixed exception
-            collection = chroma_client.create_collection(
-                name=COLLECTION_NAME,
-                embedding_function=embed_fn
-            )
+        # ✅ Use get_or_create_collection to avoid NotFoundError
+        collection = chroma_client.get_or_create_collection(
+            name=COLLECTION_NAME,
+            embedding_function=embed_fn
+        )
         vector_store = collection
 
 
