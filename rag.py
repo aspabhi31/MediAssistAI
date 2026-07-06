@@ -8,7 +8,6 @@ import chromadb
 from chromadb.utils import embedding_functions
 from groq import Groq
 from sentence_transformers import SentenceTransformer
-import requests
 
 from pubmed import PubMedRetriever
 
@@ -49,7 +48,7 @@ def initialize_components():
     if vector_store is None:
         # Use Chroma's persistent client
         chroma_client = chromadb.PersistentClient(path=str(VECTORSTORE_DIR))
-        # Use a custom embedding function that wraps SentenceTransformer
+        # Custom embedding function wrapping SentenceTransformer
         class SentenceTransformerEmbeddingFunction(embedding_functions.EmbeddingFunction):
             def __init__(self, model):
                 self.model = model
@@ -58,7 +57,6 @@ def initialize_components():
                 return self.model.encode(texts, convert_to_numpy=True).tolist()
 
         embed_fn = SentenceTransformerEmbeddingFunction(embedder)
-        # Get or create collection
         try:
             collection = chroma_client.get_collection(COLLECTION_NAME)
         except ValueError:
@@ -80,9 +78,8 @@ def split_text(text, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
     start = 0
     while start < len(text):
         end = min(start + chunk_size, len(text))
-        # If we're not at the end, try to break at a sentence boundary (., !, ?, \n)
         if end < len(text):
-            # Look for last period or newline within the chunk
+            # Try to break at sentence boundaries
             for sep in ['. ', '? ', '! ', '\n\n', '\n', '.', '?', '!']:
                 last_sep = text.rfind(sep, start, end)
                 if last_sep != -1:
@@ -97,11 +94,15 @@ def split_text(text, chunk_size=CHUNK_SIZE, overlap=CHUNK_OVERLAP):
 # Process PubMed articles (kept as `process_urls` for compatibility)
 # ----------------------------------------------------------------------
 def process_urls(search_term: str, max_results: int = 20):
+    """
+    Search PubMed, fetch articles, store them in the vector DB.
+    Yields progress messages for a streaming UI.
+    """
     yield "Initializing Components"
     initialize_components()
 
     yield "Resetting vector store...✅"
-    # Delete all documents from the collection (if any)
+    # Delete all documents from the collection
     try:
         all_ids = vector_store.get()["ids"]
         if all_ids:
@@ -119,7 +120,6 @@ def process_urls(search_term: str, max_results: int = 20):
     articles = PubMedRetriever.fetch_pubmed_abstracts(pmid_list)
     yield f"Fetched {len(articles)} articles. Building documents..."
 
-    # Prepare documents for Chroma
     ids = []
     documents = []
     metadatas = []
@@ -131,7 +131,6 @@ def process_urls(search_term: str, max_results: int = 20):
         content = f"Title: {art['title']}\n{abstract_text}"
         source_str = f"PMID: {art['pmid']} – {art['title']}"
 
-        # Split content into chunks
         chunks = split_text(content)
         for chunk in chunks:
             doc_id = str(uuid4())
@@ -142,12 +141,11 @@ def process_urls(search_term: str, max_results: int = 20):
                 "journal": art["journal"],
                 "authors": art["authors"],
                 "publication_date": art["publication_date"],
-                "source": source_str,
-                "full_text": content  # optional, but can be used if needed
+                "source": source_str
             })
 
     yield f"Splitting into {len(documents)} chunks. Adding to vector database..."
-    # Add to Chroma in batches
+    # Add in batches
     batch_size = 100
     for i in range(0, len(documents), batch_size):
         vector_store.add(
@@ -171,7 +169,6 @@ def generate_answer(query):
     if not results["documents"]:
         return "I couldn't find any relevant information.", "No sources available."
 
-    # Build context from retrieved documents
     context_parts = []
     sources_set = set()
     for doc, meta in zip(results["documents"][0], results["metadatas"][0]):
@@ -181,7 +178,6 @@ def generate_answer(query):
     context = "\n\n".join(context_parts)
     sources = "; ".join(sources_set) if sources_set else "No sources available."
 
-    # Build prompt
     prompt = f"""You are a medical expert. Use the following context to answer the question.
 If you don't know the answer, say you don't know. Cite the sources using PMID numbers.
 
@@ -192,7 +188,6 @@ Question: {query}
 
 Answer:"""
 
-    # Call Groq API
     completion = client.chat.completions.create(
         model="llama-3.3-70b-versatile",
         messages=[{"role": "user", "content": prompt}],
